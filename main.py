@@ -6,6 +6,6 @@ app = FastAPI()
 
 @app.get("/")
 async def read_root():
-    return {"message" : "Backend team is best"}
+    return {"message" : "Backend team is worst"}
 
 
