@@ -1,0 +1,10 @@
+[project]
+name = "better-yuu-backend"
+version = "0.1.0"
+description = "Be better"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi[standard]>=0.116.1",
+]
+
