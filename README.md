@@ -41,3 +41,5 @@ better-yuu-backend/          # Project root
 ├── README.md
 ├── requirements.txt         # Optional, if you still use pip requirements
 └── .env                     # Environment variables file (optional)
+
+Deployed Backend : [Better-YUU-Backend](https://better-yuu-backend.onrender.com/)
