@@ -1,168 +1,180 @@
-# app/api/v1/endpoints/auth.py
 """
-Auth router: sign-up and sign-in endpoints.
+API endpoints for user authentication, supporting both password-based and Google OAuth2 flows.
 
-Features included:
-- Signup (POST /api/v1/auth/signup) -> creates user after hashing password
-- Login  (POST /api/v1/auth/login)  -> verifies password and returns JWT access token
-- get_current_user dependency to protect routes (demonstration)
+This implementation uses a secure, HttpOnly cookie to store the JWT for all
+authentication methods, which is the recommended practice to mitigate XSS attacks.
 """
 
-from datetime import datetime, timedelta
-from typing import Dict
-
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+from fastapi import APIRouter, Depends, Request, Response, status, HTTPException
+from fastapi.responses import RedirectResponse
+from httpx_oauth.clients.google import GoogleOAuth2
+from odmantic import AIOEngine
 from passlib.context import CryptContext
-from jose import jwt, JWTError
-from pydantic import BaseModel
-
-from odmantic import ObjectId
+from pydantic import BaseModel, EmailStr
 from pymongo.errors import DuplicateKeyError
 
 from app.core.config import settings
-from app.db.session import engine
-from app.domains.users.schemas import UserCreate, UserLogin, UserModel, usermodel_to_public, UserPublic
+from app.core.security import (
+    ACCESS_TOKEN_COOKIE_NAME,
+    create_access_token,
+    get_current_user,
+)
+from app.db.session import get_engine
+from app.domains.users import services as user_services
+from app.domains.users.models import UserModel
+from app.domains.users.schemas import UserInDB
 
-# Router for this module
-router = APIRouter(prefix="/api/v1/auth", tags=["auth"])
+# --- SETUP ---
 
-# Password hashing context: bcrypt
+router = APIRouter()
+
+# Password hashing context using bcrypt
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# OAuth2 scheme for FastAPI dependency (token passed in Authorization: Bearer <token>)
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
+# Google OAuth client initialization
+google_client = GoogleOAuth2(
+    settings.GOOGLE_CLIENT_ID,
+    settings.GOOGLE_CLIENT_SECRET,
+)
 
+# --- SCHEMAS FOR PASSWORD AUTH ---
 
-# -------------------------
-# Token helpers
-# -------------------------
-def create_access_token(subject: str, expires_delta: timedelta = None) -> str:
-    """
-    Create a JWT token encoding the `subject` (usually user id as string).
-    We use HS256 and settings.JWT_SECRET. Expiry is set by ACCESS_TOKEN_EXPIRE_MINUTES.
-    """
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    payload = {"sub": subject, "exp": expire}
-    token = jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
-    return token
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    name: str | None = None
 
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+# --- HELPER FUNCTIONS ---
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a plaintext password against its bcrypt hash."""
+    """Verifies a plaintext password against its bcrypt hash."""
     return pwd_context.verify(plain_password, hashed_password)
 
-
 def get_password_hash(password: str) -> str:
-    """Hash password using bcrypt; return hashed string for DB storage."""
+    """Hashes a password using bcrypt."""
     return pwd_context.hash(password)
 
+# --- PASSWORD-BASED AUTH ENDPOINTS ---
 
-# -------------------------
-# Auth endpoints
-# -------------------------
-@router.post("/signup", response_model=UserPublic, status_code=status.HTTP_201_CREATED)
-async def signup(payload: UserCreate):
+@router.post("/signup", response_model=UserInDB, status_code=status.HTTP_201_CREATED)
+async def signup(payload: UserCreate, engine: AIOEngine = Depends(get_engine)):
     """
-    Sign up new user.
-    - Validate input via UserCreate.
-    - Hash password and save user.
-    - Create unique index on email at app startup (see main.py); here handle duplicate key errors gracefully.
+    Handles new user registration with email and password.
     """
-    # Hash password BEFORE creating DB model
+    # Check if a user with this email already exists (could be from OAuth)
+    existing_user = await engine.find_one(UserModel, UserModel.email == payload.email)
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists."
+        )
+
     password_hash = get_password_hash(payload.password)
-
-    # Build the Odmantic model
     user = UserModel(
         email=payload.email,
         password_hash=password_hash,
         name=payload.name,
-        display_name=payload.name if payload.name else None,
-        preferences={"timezone": payload.timezone, "language": payload.language}
+        display_name=payload.name,
     )
 
     try:
-        saved = await engine.save(user)  # persist to MongoDB
+        saved_user = await engine.save(user)
     except DuplicateKeyError:
-        # Unique constraint on email violated (catch at DB level)
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
-    except Exception as exc:
-        # Generic error handling (log as needed)
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not create user")
-
-    # Return public projection (no password_hash)
-    return usermodel_to_public(saved)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email already registered."
+        )
+    return saved_user
 
 
-# Token response schema
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
-@router.post("/login", response_model=TokenResponse)
-async def login(payload: UserLogin):
+@router.post("/login", status_code=status.HTTP_200_OK)
+async def login(response: Response, payload: UserLogin, engine: AIOEngine = Depends(get_engine)):
     """
-    Log a user in:
-    - Find user by email (case-sensitive by default).
-    - Verify password.
-    - Return JWT access token with 'sub' = user_id (string).
+    Handles user login with email and password.
+    On success, it sets a secure HttpOnly cookie with the JWT.
     """
-    # Find user by email
     user = await engine.find_one(UserModel, UserModel.email == payload.email)
-    if not user:
-        # Generic message to avoid leaking existence
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
-    if not verify_password(payload.password, user.password_hash):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
-
-    # (Optional) update last_login timestamp
-    user.last_login = datetime.utcnow()
-    await engine.save(user)
-
-    access_token = create_access_token(subject=str(user.id))
-    return TokenResponse(access_token=access_token)
-
-
-# -------------------------
-# Dependency: get_current_user
-# -------------------------
-async def get_current_user(token: str = Depends(oauth2_scheme)) -> UserModel:
-    """
-    Decode JWT token, fetch user from DB, and return UserModel instance.
-    Raises HTTPException on failure conditions.
-    """
-    credentials_exception = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Could not validate credentials",
-        headers={"WWW-Authenticate": "Bearer"},
+    if not user or not user.password_hash or not verify_password(payload.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password."
+        )
+    
+    access_token = create_access_token(subject=user.email)
+    response.set_cookie(
+        key=ACCESS_TOKEN_COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        samesite="lax",
+        secure=True,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
     )
-    try:
-        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
-        user_id = payload.get("sub")
-        if user_id is None:
-            raise credentials_exception
-    except JWTError:
-        raise credentials_exception
+    return {"message": "Login successful"}
 
-    # Convert to ObjectId when querying (Odmantic uses ObjectId for model.id)
-    try:
-        oid = ObjectId(user_id)
-    except Exception:
-        raise credentials_exception
+# --- GOOGLE OAUTH2 ENDPOINTS ---
 
-    user = await engine.find_one(UserModel, UserModel.id == oid)
-    if user is None:
-        raise credentials_exception
-
-    return user
-
-
-# Example protected route demonstrating dependency usage (optional)
-@router.get("/me", response_model=UserPublic)
-async def me(current_user: UserModel = Depends(get_current_user)):
+@router.get("/login/google", include_in_schema=False)
+async def login_google():
     """
-    Protected endpoint returning current user's public profile.
+    Redirects the user to Google's authentication page.
     """
-    return usermodel_to_public(current_user)
+    redirect_uri = settings.GOOGLE_REDIRECT_URI
+    authorization_url = await google_client.get_authorization_url(
+        redirect_uri, scope=["email", "profile"]
+    )
+    return RedirectResponse(authorization_url)
+
+
+@router.get("/google/callback", include_in_schema=False)
+async def auth_google_callback(request: Request, engine: AIOEngine = Depends(get_engine)):
+    """
+    Handles the callback from Google, upserts the user, sets the session cookie,
+    and redirects to the frontend.
+    """
+    code = request.query_params.get("code")
+    redirect_uri = settings.GOOGLE_REDIRECT_URI
+    token_data = await google_client.get_access_token(code, redirect_uri)
+    user_id, user_email, user_info = await google_client.get_user_info(token_data)
+
+    user = await user_services.upsert_user_from_oauth(
+        engine=engine,
+        email=user_email,
+        provider="google",
+        provider_id=user_id,
+        name_from_provider=user_info.get("name", user_email.split('@')[0]),
+    )
+
+    access_token = create_access_token(subject=user.email)
+
+    response = RedirectResponse(url=settings.FRONTEND_URL, status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(
+        key=ACCESS_TOKEN_COOKIE_NAME,
+        value=access_token,
+        httponly=True,
+        samesite="lax",
+        secure=True,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+    return response
+
+# --- COMMON SESSION ENDPOINTS ---
+
+@router.post("/logout", status_code=status.HTTP_200_OK)
+async def logout(response: Response):
+    """
+    Logs the user out by deleting the access token cookie.
+    """
+    response.delete_cookie(ACCESS_TOKEN_COOKIE_NAME)
+    return {"message": "Successfully logged out"}
+
+
+@router.get("/users/me", response_model=UserInDB)
+async def read_users_me(current_user: UserModel = Depends(get_current_user)):
+    """
+    Protected endpoint to fetch the details of the currently logged-in user.
+    """
+    return current_user
