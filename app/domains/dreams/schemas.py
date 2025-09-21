@@ -1,3 +1,4 @@
+from pydantic.config import ConfigDict
 """
 app/domains/dreams/schemas.py
 
@@ -14,7 +15,6 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from pydantic import BaseModel, Field as PydField, HttpUrl
 from odmantic import Model, Field as OdmField
-
 
 # ------------------------------
 # Small structured types used inside analysis
@@ -52,36 +52,6 @@ class DreamAnalysis(BaseModel):
     symbols: Optional[List[SymbolAnalysis]] = None
     risk_flags: Optional[RiskFlags] = None
     raw_response: Optional[Any] = None  # original LLM/AI response (audit), may store as dict/string
-
-
-# ------------------------------
-# Dream Odmantic DB model
-# ------------------------------
-class DreamModel(Model):
-    """
-    Odmantic model representing a dream entry.
-    - `user_id` stored as string for simplicity (can be changed to a Reference[UserModel] if desired).
-    - `analysis` holds the result of the AI pipeline. Start with `analysis` as None then populate when ready.
-    """
-    user_id: str = OdmField(...)  # store user id (string). Option: use Reference for real relations
-    timestamp: datetime = OdmField(default_factory=datetime.utcnow)
-    timezone: Optional[str] = OdmField(default="Asia/Kolkata")
-    text_content: Optional[str] = OdmField(default=None, metadata={"max_length": 20000})
-    audio_url: Optional[str] = OdmField(default=None)  # signed URL to Cloud Storage
-    audio_duration_seconds: Optional[float] = OdmField(default=None)
-    audio_transcript: Optional[str] = OdmField(default=None)
-    language: Optional[str] = OdmField(default="en")
-    analysis: Optional[Dict[str, Any]] = OdmField(default=None)  # store structured analysis JSON
-    share_policy: Optional[Dict[str, bool]] = OdmField(default_factory=lambda: {
-        "shareable": False, "forum_anonymous": False, "allow_research": False
-    })
-    status: str = OdmField(default="created")  # created | processing | analyzed | error
-    created_at: datetime = OdmField(default_factory=datetime.utcnow)
-    updated_at: Optional[datetime] = OdmField(default=None)
-
-    class Config:
-        json_encoders = {datetime: lambda v: v.isoformat()}
-
 
 # ------------------------------
 # Pydantic / API Schemas
@@ -131,9 +101,10 @@ class DreamDB(BaseModel):
     created_at: datetime
     updated_at: Optional[datetime] = None
 
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {datetime: lambda v: v.isoformat()}
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+    )
 
 
 # ------------------------------
@@ -144,21 +115,7 @@ def dreammodel_to_dto(d: DreamModel) -> DreamDB:
     Convert Odmantic DreamModel to DreamDB Pydantic DTO for API response.
     Handles simple field conversions and ensures proper types.
     """
-    return DreamDB(
-        **{
-            "_id": str(d.id),
-            "user_id": d.user_id,
-            "timestamp": d.timestamp,
-            "timezone": d.timezone,
-            "text_content": d.text_content,
-            "audio_url": d.audio_url,
-            "audio_duration_seconds": d.audio_duration_seconds,
-            "audio_transcript": d.audio_transcript,
-            "language": d.language,
-            "analysis": d.analysis,  # if analysis is a dict, Pydantic will coerce it
-            "share_policy": d.share_policy,
-            "status": d.status,
-            "created_at": d.created_at,
-            "updated_at": d.updated_at,
-        }
-    )
+    # Using model_dump and then constructing the DTO ensures correct aliasing and type coercion
+    model_data = d.model_dump()
+    model_data["_id"] = str(d.id) # Ensure the id is a string for the alias
+    return DreamDB.model_validate(model_data)

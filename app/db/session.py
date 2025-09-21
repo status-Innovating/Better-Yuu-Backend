@@ -13,7 +13,9 @@ _client = AsyncIOMotorClient(settings.MONGO_URI)
 engine = AIOEngine(client=_client, database=settings.MONGO_DB)
 
 
-
+# Optional helper to get engine in other places if you prefer function API
+def get_engine() -> AIOEngine:
+    return engine
 
 # Usage NOTE:
 # - await engine.save(model_instance)
