@@ -13,7 +13,7 @@ Notes:
 
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from pydantic import BaseModel, EmailStr, Field as PydField
+from pydantic import BaseModel, EmailStr, Field as PydField, ConfigDict
 from odmantic import Model, Field as OdmField
 
 # ------------------------------
@@ -188,3 +188,24 @@ def usermodel_to_public(user: UserModel) -> UserPublic:
             "created_at": user.created_at,
         }
     )
+
+
+
+class UserInDB(BaseModel):
+    """
+    Pydantic schema for returning user data via the API.
+    This is the correct Pydantic v2 syntax.
+    """
+    # model_config is the new way to configure models in v2
+    model_config = ConfigDict(from_attributes=True)
+
+    id: str
+    email: EmailStr
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    pseudonym: Optional[str] = None
+    is_mentor: bool
+    roles: List[str]
+    status: str
+    created_at: datetime
+    last_login: Optional[datetime] = None

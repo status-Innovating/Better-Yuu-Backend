@@ -10,7 +10,7 @@ from pymongo.errors import OperationFailure
 
 from app.core.config import settings
 from app.db.session import engine
-from app.domains.users.schemas import UserModel
+from app.domains.users.models import UserModel
 from app.api.v1.endpoints import auth as auth_router_module  # import router module
 
 app = FastAPI(title=settings.APP_NAME)

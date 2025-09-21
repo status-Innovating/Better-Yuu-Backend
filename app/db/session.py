@@ -14,6 +14,12 @@ engine = AIOEngine(client=_client, database=settings.MONGO_DB)
 
 
 
+# --- THIS IS THE NEW, REQUIRED FUNCTION ---
+async def get_engine() -> AIOEngine:
+    """
+    FastAPI dependency that provides a reusable AIOEngine instance.
+    """
+    return engine
 
 # Usage NOTE:
 # - await engine.save(model_instance)
